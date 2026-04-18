@@ -71,6 +71,9 @@ NO_ENTRY_LOG_EVERY_SEC = float(os.getenv("POLYMARKET_NO_ENTRY_LOG_EVERY_SEC", "3
 
 # Strategy (v1)
 POSITION_SIZE = float(os.getenv("POLYMARKET_POSITION_SIZE", "1"))
+POLYMARKET_ORDER_USD_AMOUNT = float(os.getenv("POLYMARKET_ORDER_USD_AMOUNT", "0.75"))
+POLYMARKET_ORDER_SIZE_SHARES = float(os.getenv("POLYMARKET_ORDER_SIZE_SHARES", "0"))
+POLYMARKET_BUY_AMOUNT_MODE = os.getenv("POLYMARKET_BUY_AMOUNT_MODE", "shares").strip().lower()
 ENTRY_MIN_PRICE = float(os.getenv("POLYMARKET_ENTRY_MIN_PRICE", "0.67"))
 ENTRY_MAX_PRICE = float(os.getenv("POLYMARKET_ENTRY_MAX_PRICE", "0.79"))
 MARKET_WARMUP_SEC = float(os.getenv("POLYMARKET_MARKET_WARMUP_SEC", "8"))
@@ -130,6 +133,13 @@ class PositionState:
     peak_price_since_trailing: Optional[float] = None
     max_favorable_return: float = 0.0
     max_adverse_return: float = 0.0
+    filled_size: float = 0.0
+    avg_entry_price: float = 0.0
+    avg_exit_price: float = 0.0
+    open_order_id: Optional[str] = None
+    close_order_id: Optional[str] = None
+    order_status: str = "new"
+    pending_order: bool = False
 
 
 @dataclass
@@ -145,6 +155,13 @@ class WindowState:
     )
     last_exit_reason: Optional[str] = None
     last_exit_pnl: Optional[float] = None
+    open_order_id: Optional[str] = None
+    close_order_id: Optional[str] = None
+    filled_size: float = 0.0
+    avg_entry_price: float = 0.0
+    avg_exit_price: float = 0.0
+    order_status: str = "idle"
+    pending_order: bool = False
 
 
 @dataclass
@@ -781,30 +798,272 @@ class PolymarketDataClient:
 class TradeExecutor:
     def __init__(self, dry_run: bool) -> None:
         self.dry_run = dry_run
+        self.market: Optional[Dict] = None
+        self.last_order_result: Dict = {}
+        self._live_client = None
+        self._OrderType = None
+        self._MarketOrderArgs = None
+        self._BUY = None
+        self._SELL = None
+        if not self.dry_run:
+            self._init_live_client()
+
+    def _init_live_client(self) -> None:
+        missing = []
+        for name, value in (
+            ("POLYMARKET_PRIVATE_KEY", PRIVATE_KEY),
+            ("POLYMARKET_WALLET_ADDRESS", WALLET_ADDRESS),
+            ("POLYMARKET_FUNDER_ADDRESS", FUNDER_ADDRESS),
+            ("POLYMARKET_CLOB_API_URL", CLOB_API_URL),
+        ):
+            if not str(value or "").strip():
+                missing.append(name)
+        if missing:
+            raise RuntimeError(
+                f"POLYMARKET_DRY_RUN=0 requires live execution config. Missing: {', '.join(missing)}"
+            )
+        if CHAIN_ID != 137:
+            raise RuntimeError(f"POLYMARKET_CHAIN_ID must be 137 for live CLOB trading, got {CHAIN_ID}")
+        try:
+            from py_clob_client.client import ClobClient
+            from py_clob_client.clob_types import MarketOrderArgs, OrderType
+            from py_clob_client.order_builder.constants import BUY, SELL
+        except Exception as exc:
+            raise RuntimeError(
+                "POLYMARKET_DRY_RUN=0 requires official dependency 'py-clob-client'. "
+                "Install it before startup."
+            ) from exc
+
+        try:
+            self._live_client = ClobClient(
+                CLOB_API_URL,
+                key=PRIVATE_KEY,
+                chain_id=137,
+                signature_type=SIGNATURE_TYPE,
+                funder=FUNDER_ADDRESS,
+            )
+            self._live_client.set_api_creds(self._live_client.create_or_derive_api_creds())
+        except Exception as exc:
+            raise RuntimeError(f"Failed to initialize live Polymarket CLOB client: {exc}") from exc
+
+        self._OrderType = OrderType
+        self._MarketOrderArgs = MarketOrderArgs
+        self._BUY = BUY
+        self._SELL = SELL
+        logger.info(
+            "Live CLOB executor initialized wallet=%s funder=%s chain_id=%s host=%s signature_type=%s",
+            WALLET_ADDRESS,
+            FUNDER_ADDRESS,
+            137,
+            CLOB_API_URL,
+            SIGNATURE_TYPE,
+        )
+
+    def set_market(self, market: Optional[Dict]) -> None:
+        self.market = market
+
+    def _extract_order_id(self, payload: object) -> Optional[str]:
+        if isinstance(payload, dict):
+            for key in ("orderID", "orderId", "id"):
+                if payload.get(key):
+                    return str(payload[key])
+            nested = payload.get("order")
+            if isinstance(nested, dict):
+                for key in ("orderID", "orderId", "id"):
+                    if nested.get(key):
+                        return str(nested[key])
+        return None
+
+    @staticmethod
+    def _to_float(value: object) -> Optional[float]:
+        try:
+            out = float(value)
+            if out >= 0:
+                return out
+        except Exception:
+            pass
+        return None
+
+    def _extract_fill_details(self, payload: object) -> Tuple[float, float, str]:
+        status = "unknown"
+        filled = 0.0
+        avg_price = 0.0
+        if isinstance(payload, dict):
+            raw_status = payload.get("status") or payload.get("state") or payload.get("orderStatus")
+            if raw_status is not None:
+                status = str(raw_status).lower()
+            for key in ("filled_size", "filledSize", "size_matched", "matched", "filled"):
+                maybe = self._to_float(payload.get(key))
+                if maybe is not None:
+                    filled = maybe
+                    break
+            for key in ("avg_price", "avgPrice", "average_price", "price", "execution_price"):
+                maybe = self._to_float(payload.get(key))
+                if maybe is not None:
+                    avg_price = maybe
+                    break
+        return filled, avg_price, status
+
+    def _resolve_token(self, side: Side) -> str:
+        if not self.market:
+            raise RuntimeError("Live executor has no market set for token resolution")
+        token_ids = PolymarketDataClient._extract_token_ids(self.market)
+        token = token_ids.get(side)
+        if not token:
+            raise RuntimeError(f"Could not resolve token_id for side={side}")
+        return token
+
+    def _await_order_fill(self, order_id: str, timeout_sec: float = 3.0) -> Tuple[float, float, str]:
+        if not self._live_client:
+            return 0.0, 0.0, "client_unavailable"
+        deadline = time.time() + max(0.2, timeout_sec)
+        last_status = "submitted"
+        while time.time() < deadline:
+            try:
+                status_payload = self._live_client.get_order(order_id)
+            except Exception:
+                status_payload = None
+            filled, avg_px, status = self._extract_fill_details(status_payload)
+            if status not in {"unknown", ""}:
+                last_status = status
+            if filled > 0 and status in {"matched", "filled", "live", "completed"}:
+                return filled, avg_px, status
+            if status in {"rejected", "cancelled", "canceled", "expired", "failed"}:
+                return filled, avg_px, status
+            time.sleep(0.2)
+        return 0.0, 0.0, f"timeout:{last_status}"
+
+    def _resolve_live_buy_amount(self, requested_size: float) -> float:
+        """
+        BUY amount mode:
+        - shares (default): uses POLYMARKET_ORDER_SIZE_SHARES if > 0 else requested size.
+        - usd: uses POLYMARKET_ORDER_USD_AMOUNT.
+        """
+        mode = POLYMARKET_BUY_AMOUNT_MODE
+        if mode not in {"shares", "usd"}:
+            raise RuntimeError(
+                f"Unsupported POLYMARKET_BUY_AMOUNT_MODE={mode}. Use 'shares' or 'usd'."
+            )
+        if mode == "usd":
+            if POLYMARKET_ORDER_USD_AMOUNT <= 0:
+                raise RuntimeError("POLYMARKET_ORDER_USD_AMOUNT must be > 0 in usd mode")
+            return POLYMARKET_ORDER_USD_AMOUNT
+        shares = POLYMARKET_ORDER_SIZE_SHARES if POLYMARKET_ORDER_SIZE_SHARES > 0 else requested_size
+        if shares <= 0:
+            raise RuntimeError(
+                "Live BUY shares amount is not valid. Set POLYMARKET_ORDER_SIZE_SHARES>0 or POLYMARKET_POSITION_SIZE>0."
+            )
+        return shares
 
     def open_position(self, side: Side, size: float, entry_price: float) -> str:
         order_id = f"dry-open-{int(time.time()*1000)}"
         if self.dry_run:
             logger.info("[DRY-RUN] OPEN %s size=%.4f price=%.4f", side, size, entry_price)
+            self.last_order_result = {
+                "order_id": order_id,
+                "filled_size": size,
+                "avg_price": entry_price,
+                "status": "filled",
+            }
             return order_id
-        # TODO(live-1): Implement signed order placement for open_position via Polymarket CLOB API.
-        raise NotImplementedError("Live order placement is not wired in this version")
+        if not self._live_client:
+            raise RuntimeError("Live CLOB executor is not initialized")
 
-    def place_protective_sl(self, side: Side, size: float, sl_price: float) -> str:
+        token_id = self._resolve_token(side)
+        amount = self._resolve_live_buy_amount(size)
+        args_kwargs = {
+            "token_id": token_id,
+            "amount": amount,
+            "side": self._BUY,
+            "order_type": self._OrderType.FOK,
+        }
+        # Price is the worst acceptable fill (slippage cap).
+        args_kwargs["price"] = max(0.01, min(0.99, float(entry_price)))
+        signed = self._live_client.create_market_order(self._MarketOrderArgs(**args_kwargs))
+        response = self._live_client.post_order(signed, self._OrderType.FOK)
+        live_order_id = self._extract_order_id(response)
+        if not live_order_id:
+            raise RuntimeError(f"Live open order rejected/unacknowledged: {response}")
+
+        filled, avg_px, status = self._await_order_fill(live_order_id)
+        if filled <= 0 or status.startswith("timeout") or status in {"rejected", "cancelled", "canceled", "failed"}:
+            self.last_order_result = {
+                "order_id": live_order_id,
+                "filled_size": filled,
+                "avg_price": avg_px or entry_price,
+                "status": status,
+            }
+            raise RuntimeError(f"Live open order not filled (status={status}, order_id={live_order_id})")
+        self.last_order_result = {
+            "order_id": live_order_id,
+            "filled_size": filled,
+            "avg_price": avg_px or entry_price,
+            "status": status,
+        }
+        return live_order_id
+
+    def place_protective_sl(self, side: Side, size: float, sl_price: float) -> Optional[str]:
         order_id = f"dry-sl-{int(time.time()*1000)}"
         if self.dry_run:
             logger.info("[DRY-RUN] PLACE SL %s size=%.4f sl_price=%.4f", side, size, sl_price)
             return order_id
-        # TODO(live-2): Implement protective SL order placement for place_protective_sl.
-        raise NotImplementedError("Live SL placement is not wired in this version")
+        logger.info(
+            "[LIVE] SL hook only (bot-managed SL; no resting order placed) side=%s size=%.4f sl_price=%.4f",
+            side,
+            size,
+            sl_price,
+        )
+        return None
 
     def close_position(self, side: Side, size: float, reason: str) -> str:
         order_id = f"dry-close-{int(time.time()*1000)}"
         if self.dry_run:
             logger.info("[DRY-RUN] CLOSE %s size=%.4f reason=%s", side, size, reason)
+            self.last_order_result = {
+                "order_id": order_id,
+                "filled_size": size,
+                "avg_price": 0.0,
+                "status": "filled",
+            }
             return order_id
-        # TODO(live-3): Implement live close_position order placement.
-        raise NotImplementedError("Live close placement is not wired in this version")
+        if not self._live_client:
+            raise RuntimeError("Live CLOB executor is not initialized")
+        if size <= 0:
+            raise RuntimeError(f"Close requested with non-positive size={size}")
+
+        token_id = self._resolve_token(side)
+        args_kwargs = {
+            "token_id": token_id,
+            "amount": float(size),
+            "side": self._SELL,
+            "order_type": self._OrderType.FOK,
+        }
+        # Worst acceptable execution protection for marketable close.
+        args_kwargs["price"] = 0.01
+        signed = self._live_client.create_market_order(self._MarketOrderArgs(**args_kwargs))
+        response = self._live_client.post_order(signed, self._OrderType.FOK)
+        live_order_id = self._extract_order_id(response)
+        if not live_order_id:
+            raise RuntimeError(f"Live close order rejected/unacknowledged: {response}")
+
+        filled, avg_px, status = self._await_order_fill(live_order_id)
+        if filled <= 0 or status.startswith("timeout") or status in {"rejected", "cancelled", "canceled", "failed"}:
+            self.last_order_result = {
+                "order_id": live_order_id,
+                "filled_size": filled,
+                "avg_price": avg_px,
+                "status": status,
+            }
+            raise RuntimeError(
+                f"Live close order not filled (status={status}, order_id={live_order_id}, reason={reason})"
+            )
+        self.last_order_result = {
+            "order_id": live_order_id,
+            "filled_size": filled,
+            "avg_price": avg_px,
+            "status": status,
+        }
+        return live_order_id
 
 
 # =========================
@@ -853,6 +1112,13 @@ class BeethovenV1Bot:
                 same_side_cooldown_until=ws.get("same_side_cooldown_until", {"up": 0.0, "down": 0.0}),
                 last_exit_reason=ws.get("last_exit_reason"),
                 last_exit_pnl=ws.get("last_exit_pnl"),
+                open_order_id=ws.get("open_order_id"),
+                close_order_id=ws.get("close_order_id"),
+                filled_size=ws.get("filled_size", 0.0),
+                avg_entry_price=ws.get("avg_entry_price", 0.0),
+                avg_exit_price=ws.get("avg_exit_price", 0.0),
+                order_status=ws.get("order_status", "idle"),
+                pending_order=ws.get("pending_order", False),
             )
         self.session_stats = SessionStats(**payload.get("session_stats", {}))
 
@@ -1139,29 +1405,60 @@ class BeethovenV1Bot:
 
     def _open_position(self, snap: MarketSnapshot, side: Side) -> None:
         assert self.window_state is not None
+        if self.window_state.pending_order:
+            logger.info("Skip entry: pending order status=%s", self.window_state.order_status)
+            return
         entry_price = snap.buy_prices[side]
-        open_order_id = self.exec.open_position(side=side, size=POSITION_SIZE, entry_price=entry_price)
+        self.window_state.pending_order = True
+        self.window_state.order_status = "open_pending"
+        self._save_state()
+        try:
+            open_order_id = self.exec.open_position(side=side, size=POSITION_SIZE, entry_price=entry_price)
+        except Exception as exc:
+            self.window_state.pending_order = False
+            self.window_state.order_status = "open_failed"
+            self._save_state()
+            logger.error("OPEN failed side=%s err=%s", side, exc)
+            return
+        open_fill = self.exec.last_order_result or {}
+        filled_size = float(open_fill.get("filled_size") or 0.0)
+        avg_entry_price = float(open_fill.get("avg_price") or entry_price)
+        order_status = str(open_fill.get("status") or "filled")
+        if filled_size <= 0:
+            self.window_state.pending_order = False
+            self.window_state.order_status = "open_not_filled"
+            self._save_state()
+            logger.warning("OPEN order not filled side=%s order_id=%s", side, open_order_id)
+            return
 
         sl_price = entry_price * (1.0 - SL_PCT)
         sl_order_id = self.exec.place_protective_sl(side=side, size=POSITION_SIZE, sl_price=sl_price)
-        # TODO(live-4): Persist live order IDs for open/sl orders in state.
-        # TODO(live-6): Handle reject / partial fill / timeout / retry.
-        # TODO(live-7): Block new entries until previous order status is confirmed.
+        sl_hook_id = None if DRY_RUN else f"live-sl-hook-{int(time.time()*1000)}"
 
         self.window_state.active = True
+        self.window_state.pending_order = False
+        self.window_state.open_order_id = open_order_id
+        self.window_state.filled_size = filled_size
+        self.window_state.avg_entry_price = avg_entry_price
+        self.window_state.order_status = order_status
         self.window_state.current_position = PositionState(
             window_id=snap.window_id,
             side=side,
-            entry_price=entry_price,
+            entry_price=avg_entry_price,
             entry_time=snap.timestamp,
-            size=POSITION_SIZE,
+            size=filled_size,
+            filled_size=filled_size,
+            avg_entry_price=avg_entry_price,
+            open_order_id=open_order_id,
+            order_status=order_status,
+            pending_order=False,
         )
         self.trade_log.log(
             {
                 "event": "entry",
                 "window_id": snap.window_id,
                 "side": side,
-                "entry_price": entry_price,
+                "entry_price": avg_entry_price,
                 "entry_buy_price": snap.buy_prices[side],
                 "entry_ref_price": snap.ref_prices[side],
                 "current_monitor_price_for_sl": self._monitor_price_for_side(snap, side),
@@ -1176,13 +1473,18 @@ class BeethovenV1Bot:
                 "down_top_bid_size": snap.top_bid_sizes["down"],
                 "down_top_ask_size": snap.top_ask_sizes["down"],
                 "entry_time": snap.timestamp,
-                "size": POSITION_SIZE,
+                "size": filled_size,
                 "attempt": self.window_state.attempt_count_per_side[side] + 1,
                 "trailing_arm_at_return": TP_PCT,
                 "trailing_drop_pct": TRAILING_DROP_PCT,
                 "sl_pct": SL_PCT,
                 "open_order_id": open_order_id,
+                "protective_sl_mode": "exchange_order" if DRY_RUN else "bot_managed",
                 "sl_order_id": sl_order_id,
+                "sl_hook_id": sl_hook_id,
+                "order_status": order_status,
+                "filled_size": filled_size,
+                "avg_entry_price": avg_entry_price,
             }
         )
         self.session_stats.opened_total += 1
@@ -1193,6 +1495,9 @@ class BeethovenV1Bot:
         pos = self.window_state.current_position
         if not pos:
             return
+        if self.window_state.pending_order:
+            logger.info("Skip close: another order pending status=%s", self.window_state.order_status)
+            return
 
         exit_price = self._monitor_price_for_side(snap, pos.side)
         pnl = (exit_price - pos.entry_price) / pos.entry_price
@@ -1200,7 +1505,31 @@ class BeethovenV1Bot:
             # Down token price still uses token mark-to-market; keep same formula.
             pnl = (exit_price - pos.entry_price) / pos.entry_price
 
-        close_order_id = self.exec.close_position(side=pos.side, size=pos.size, reason=reason)
+        close_size = pos.filled_size if pos.filled_size > 0 else pos.size
+        self.window_state.pending_order = True
+        self.window_state.order_status = "close_pending"
+        self._save_state()
+        try:
+            close_order_id = self.exec.close_position(side=pos.side, size=close_size, reason=reason)
+        except Exception as exc:
+            self.window_state.pending_order = False
+            self.window_state.order_status = "close_failed"
+            self._save_state()
+            logger.error(
+                "CLOSE failed side=%s reason=%s err=%s; position remains active and will retry on next eligible tick",
+                pos.side,
+                reason,
+                exc,
+            )
+            return
+        close_fill = self.exec.last_order_result or {}
+        close_status = str(close_fill.get("status") or "filled")
+        avg_exit_price = float(close_fill.get("avg_price") or exit_price)
+        actual_close_size = float(close_fill.get("filled_size") or close_size)
+        self.window_state.pending_order = False
+        self.window_state.close_order_id = close_order_id
+        self.window_state.avg_exit_price = avg_exit_price
+        self.window_state.order_status = close_status
 
         self.window_state.attempt_count_per_side[pos.side] = (
             self.window_state.attempt_count_per_side.get(pos.side, 0) + 1
@@ -1221,6 +1550,7 @@ class BeethovenV1Bot:
                 "side": pos.side,
                 "entry_price": pos.entry_price,
                 "exit_price": exit_price,
+                "avg_exit_price": avg_exit_price,
                 "exit_ref_price": snap.ref_prices[pos.side],
                 "current_monitor_price_for_sl": exit_price,
                 "up_bid": snap.bids["up"],
@@ -1246,6 +1576,8 @@ class BeethovenV1Bot:
                 "max_adverse_excursion": pos.max_adverse_return,
                 "tp_armed": pos.trailing_armed,
                 "close_order_id": close_order_id,
+                "close_order_status": close_status,
+                "close_filled_size": actual_close_size,
             }
         )
         self.session_trade_stats.append(
@@ -1385,6 +1717,7 @@ class BeethovenV1Bot:
                             strict_slug=BTC_5M_SLUG,
                         )
                         self._on_market_changed(self.market)
+                        self.exec.set_market(self.market)
                         self.discovery_fail_count = 0
                         self.next_discovery_at = 0.0
                         logger.info(
@@ -1413,6 +1746,7 @@ class BeethovenV1Bot:
                     if self.market:
                         self.data.mark_candidate_rejected(self.market, "near_expiry_current_window")
                     self.market = None
+                    self.exec.set_market(None)
                     self.market_key = None
                     self.next_discovery_at = max(self.next_discovery_at, current_end_ts + 0.5)
                     continue
@@ -1452,6 +1786,7 @@ class BeethovenV1Bot:
                 if self.market:
                     self.data.mark_candidate_rejected(self.market, str(exc))
                 self.market = None
+                self.exec.set_market(None)
                 self.market_key = None
                 self.next_discovery_at = time.time() + max(DISCOVERY_RETRY_SEC, CHECK_INTERVAL_SEC)
                 time.sleep(CHECK_INTERVAL_SEC)
@@ -1460,18 +1795,21 @@ class BeethovenV1Bot:
                 if self.market:
                     self.data.mark_candidate_rejected(self.market, str(exc))
                 self.market = None
+                self.exec.set_market(None)
                 self.market_key = None
                 self.next_discovery_at = time.time() + max(DISCOVERY_RETRY_SEC, CHECK_INTERVAL_SEC)
                 time.sleep(CHECK_INTERVAL_SEC)
             except DiscoveryError as exc:
                 logger.error("Discovery error: %s", exc)
                 self.market = None
+                self.exec.set_market(None)
                 self.market_key = None
                 self.next_discovery_at = time.time() + max(DISCOVERY_RETRY_SEC, CHECK_INTERVAL_SEC)
                 time.sleep(CHECK_INTERVAL_SEC)
             except SnapshotError as exc:
                 logger.error("Snapshot error: %s", exc)
                 self.market = None
+                self.exec.set_market(None)
                 self.market_key = None
                 time.sleep(min(max(CHECK_INTERVAL_SEC, 1.0), 5.0))
             except Exception as exc:
@@ -1480,8 +1818,21 @@ class BeethovenV1Bot:
 
 
 def main() -> int:
-    if not DRY_RUN and not PRIVATE_KEY:
-        raise RuntimeError("POLYMARKET_PRIVATE_KEY is required when POLYMARKET_DRY_RUN=0")
+    if not DRY_RUN:
+        missing = []
+        for name, value in (
+            ("POLYMARKET_PRIVATE_KEY", PRIVATE_KEY),
+            ("POLYMARKET_WALLET_ADDRESS", WALLET_ADDRESS),
+            ("POLYMARKET_FUNDER_ADDRESS", FUNDER_ADDRESS),
+            ("POLYMARKET_SIGNATURE_TYPE", str(SIGNATURE_TYPE)),
+            ("POLYMARKET_CLOB_API_URL", CLOB_API_URL),
+        ):
+            if not str(value or "").strip():
+                missing.append(name)
+        if missing:
+            raise RuntimeError(
+                "Live mode startup check failed. Missing required env vars: " + ", ".join(missing)
+            )
     bot = BeethovenV1Bot()
 
     def _stop(_signum, _frame):
@@ -1492,10 +1843,13 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _stop)
 
     logger.info(
-        "Starting Beethoven v1 bot: dry_run=%s market_slug=%s scan_interval=%ss",
+        "Starting Beethoven v1 bot: dry_run=%s market_slug=%s scan_interval=%ss buy_amount_mode=%s size_shares=%.4f usd_amount=%.4f",
         DRY_RUN,
         BTC_5M_SLUG,
         CHECK_INTERVAL_SEC,
+        POLYMARKET_BUY_AMOUNT_MODE,
+        POLYMARKET_ORDER_SIZE_SHARES,
+        POLYMARKET_ORDER_USD_AMOUNT,
     )
     bot.run()
     return 0
